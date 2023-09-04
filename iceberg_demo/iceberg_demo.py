@@ -24,5 +24,30 @@ spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
+## Read Input Table
+IncrementalInputDyF = glueContext.create_dynamic_frame.from_catalog(database = "iceberg_demo", table_name = "raw_csv_input", transformation_ctx = "IncrementalInputDyF")
+IncrementalInputDF = IncrementalInputDyF.toDF()
 
-job.commit()
+if not IncrementalInputDF.rdd.isEmpty():
+    ## Apply De-duplication logic on input data, to pickup latest record based on timestamp and operation
+    IDWindowDF = Window.partitionBy(IncrementalInputDF.product_id).orderBy(IncrementalInputDF.last_update_time).rangeBetween(-sys.maxsize, sys.maxsize)
+    
+    inputDFWithTS = IncrementalInputDF.withColumn("max_op_date", max(IncrementalInputDF.last_update_time).over(IDWindowDF))
+    
+    NewInsertsDF = inputDFWithTS.filter("last_update_time=max_op_date").filter("op='I")
+    UpdateDeleteDf = inputDFWithTS.filter("last_update_time=max_op_date").filter("op IN ('U', 'D')")
+    finalInputDF = NewInsertsDF.unionAll(UpdateDeleteDf)
+
+    finalInputDF.createOrReplaceTempView("incremental_input_data")
+    finalInputDF.show()
+    
+    IcebergMergeOutputDF = spark.sql("""
+    MERGE INTO job_catalog.iceberg_demo.iceberg_output t
+    USING (SELECT op, product_id, category, product_name, quantity_available, to_timestamp(last_update_time) as last_update_time FROM incremental_input_data) s
+    ON t.product_id = s.product_id
+    WHEN MATCHED AND s.op = 'D' THEN DELETE
+    WHEN MATCHED THEN UPDATE SET t.quantity_available = s.quantity_available, t.last_update_time = s.last_update_time 
+    WHEN NOT MATCHED THEN INSERT (product_id, category, product_name, quantity_available, last_update_time) VALUES (s.product_id, s.category, s.product_name, s.quantity_available, s.last_update_time)
+    """)f
+    
+    job.commit()
